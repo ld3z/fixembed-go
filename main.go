@@ -1184,16 +1184,16 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 				modifiedLink = strings.ReplaceAll(originalLink, "instagram.com", "instafix.ldez.top")
 			case "Reddit":
 				if strings.Contains(originalLink, "old.reddit.com") {
-					modifiedLink = strings.ReplaceAll(originalLink, "old.reddit.com", "vxreddit.com")
+					modifiedLink = strings.ReplaceAll(originalLink, "old.reddit.com", "old.rxddit.com")
 				} else {
-					modifiedLink = strings.ReplaceAll(originalLink, "reddit.com", "vxreddit.com")
+					modifiedLink = strings.ReplaceAll(originalLink, "reddit.com", "vxreddit.ldez.workers.dev")
 				}
 			case "Threads":
 				modifiedLink = strings.ReplaceAll(originalLink, "threads.net", "fixthreads.net")
 			case "Pixiv":
 				modifiedLink = strings.ReplaceAll(originalLink, "pixiv.net", "phixiv.net")
 			case "Bluesky":
-				modifiedLink = strings.ReplaceAll(originalLink, "bsky.app", "bskyx.app")
+				modifiedLink = strings.ReplaceAll(originalLink, "bsky.app", "fxbsky.app")
 			}
 
 			formattedMessage := fmt.Sprintf("[%s](https://%s)", displayText, modifiedLink)
