@@ -1040,8 +1040,8 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 	}
 
 	// Patterns from Python ported
-	linkPattern := `https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.net/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)`
-	surroundedPattern := `<https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.net/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)>`
+	linkPattern := `https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)`
+	surroundedPattern := `<https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)>`
 
 	// Debug: show the regex patterns we're using
 	log.Printf("[DEBUG] onMessageCreate: linkPattern=%q surroundedPattern=%q", linkPattern, surroundedPattern)
@@ -1126,9 +1126,9 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 			} else {
 				userOrCommunity = "Unknown"
 			}
-		case "threads.net":
+		case "threads.net", "threads.com":
 			service = "Threads"
-			re := regexp.MustCompile(`threads\.net/@([^/]+)/post/([A-Za-z0-9_-]+)`)
+			re := regexp.MustCompile(`threads\.(?:net|com)/@([^/]+)/post/([A-Za-z0-9_-]+)`)
 			mm := re.FindStringSubmatch(originalLink)
 			if len(mm) > 2 {
 				userOrCommunity = mm[1]
@@ -1190,6 +1190,7 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 				}
 			case "Threads":
 				modifiedLink = strings.ReplaceAll(originalLink, "threads.net", "fixthreads.net")
+				modifiedLink = strings.ReplaceAll(modifiedLink, "threads.com", "fixthreads.net")
 			case "Pixiv":
 				modifiedLink = strings.ReplaceAll(originalLink, "pixiv.net", "phixiv.net")
 			case "Bluesky":
@@ -1349,17 +1350,17 @@ func main() {
 		}
 
 		created := 0
+		// Force-sync commands for each guild to avoid duplicates left from previous runs.
+		// ApplicationCommandBulkOverwrite replaces the guild's commands with exactly `commands`.
 		for _, g := range s.State.Guilds {
-			for _, cmd := range commands {
-				_, err := s.ApplicationCommandCreate(s.State.User.ID, g.ID, cmd)
-				if err != nil {
-					log.Printf("Warning: failed to create command %s in guild %s: %v", cmd.Name, g.ID, err)
-				} else {
-					created++
-				}
+			_, err := s.ApplicationCommandBulkOverwrite(s.State.User.ID, g.ID, commands)
+			if err != nil {
+				log.Printf("Warning: failed to sync commands in guild %s: %v", g.ID, err)
+			} else {
+				created++
 			}
 		}
-		log.Printf("Registered %d command(s) across %d guild(s)", len(commands), len(s.State.Guilds))
+		log.Printf("Synchronized commands across %d guild(s)", created)
 	})
 
 	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
