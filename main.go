@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,7 +20,7 @@ import (
 )
 
 // Version number
-const VERSION = "1.1.8"
+const VERSION = "1.1.9"
 
 // Rate-limiting configuration
 const MESSAGE_LIMIT = 5
@@ -44,9 +46,30 @@ var (
 	ownerID string
 
 	statuses = []string{
-		"for Twitter links", "for Reddit links", "for Instagram links", "for Threads links", "for Pixiv links", "for Bluesky links",
+		"for Twitter links", "for Reddit links", "for Instagram links", "for Threads links", "for Pixiv links", "for Bluesky links", "for Facebook links",
 	}
 )
+
+const linkPattern = `https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+|facebook\.com/(?:[^/]+/posts/[0-9]+|groups/[0-9]+/posts/[0-9]+|reel/[A-Za-z0-9_-]+|watch/\?v=[0-9]+|photo\.php\?fbid=[0-9]+)|m\.facebook\.com/(?:[^/]+/posts/[0-9]+|groups/[0-9]+/posts/[0-9]+|reel/[A-Za-z0-9_-]+|watch/\?v=[0-9]+|photo\.php\?fbid=[0-9]+))`
+const surroundedPattern = `<https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+|facebook\.com/(?:[^/]+/posts/[0-9]+|groups/[0-9]+/posts/[0-9]+|reel/[A-Za-z0-9_-]+|watch/\?v=[0-9]+|photo\.php\?fbid=[0-9]+)|m\.facebook\.com/(?:[^/]+/posts/[0-9]+|groups/[0-9]+/posts/[0-9]+|reel/[A-Za-z0-9_-]+|watch/\?v=[0-9]+|photo\.php\?fbid=[0-9]+))>`
+
+var (
+	reLinkCompiled       *regexp.Regexp
+	reSurroundedCompiled *regexp.Regexp
+)
+
+func compileRegexes() error {
+	var err error
+	reLinkCompiled, err = regexp.Compile(linkPattern)
+	if err != nil {
+		return fmt.Errorf("compile linkPattern: %w", err)
+	}
+	reSurroundedCompiled, err = regexp.Compile(surroundedPattern)
+	if err != nil {
+		return fmt.Errorf("compile surroundedPattern: %w", err)
+	}
+	return nil
+}
 
 // GuildSettings mirrors the Python structure
 type GuildSettings struct {
@@ -56,7 +79,7 @@ type GuildSettings struct {
 }
 
 func defaultServices() []string {
-	return []string{"Twitter", "Instagram", "Reddit", "Threads", "Pixiv", "Bluesky"}
+	return []string{"Twitter", "Instagram", "Reddit", "Threads", "Pixiv", "Bluesky", "Facebook"}
 }
 
 func rateLimitedSend(s *discordgo.Session, channelID string, content string) error {
@@ -392,7 +415,8 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 						"- [vxReddit](https://github.com/dylanpdx/vxReddit), created by dylanpdx\n" +
 						"- [fixthreads](https://github.com/milanmdev/fixthreads), created by milanmdev\n" +
 						"- [phixiv](https://github.com/thelaao/phixiv), created by thelaao\n" +
-						"- [VixBluesky](https://github.com/Rapougnac/VixBluesky), created by Rapougnac",
+						"- [VixBluesky](https://github.com/Rapougnac/VixBluesky), created by Rapougnac\n" +
+						"- [Facebed](https://github.com/facebed/facebed), created by Facebed",
 					Inline: false,
 				},
 			}
@@ -1092,11 +1116,16 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 
 // Helper: discord ID string to int64
 func discordIDStringToInt64(s string) (int64, error) {
-	// discordgo provides helper in Snowflake types; but we can parse directly
-	// Accept strings like "123456789012345678"
-	var id int64
-	_, err := fmt.Sscan(s, &id)
-	return id, err
+	// Parse as unsigned to align with Discord Snowflake semantics; guard against int64 overflow.
+	s = strings.TrimSpace(s)
+	u, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if u > uint64(math.MaxInt64) {
+		return 0, fmt.Errorf("snowflake exceeds int64: %s", s)
+	}
+	return int64(u), nil
 }
 
 func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -1140,20 +1169,15 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 		return
 	}
 
-	// Patterns from Python ported
-	linkPattern := `https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)`
-	surroundedPattern := `<https?://(?:www\.)?(twitter\.com/[A-Za-z0-9_]+/status/[0-9]+|x\.com/[A-Za-z0-9_]+/status/[0-9]+|instagram\.com/(?:p|reel)/[A-Za-z0-9_-]+|reddit\.com/r/[A-Za-z0-9_]+/s/[A-Za-z0-9_]+|reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|old\.reddit\.com/r/[A-Za-z0-9_]+/comments/[A-Za-z0-9_]+/[A-Za-z0-9_]+|pixiv\.net/(?:en/)?artworks/[0-9]+|threads\.(?:net|com)/@[^/]+/post/[A-Za-z0-9_-]+|bsky\.app/profile/[^/]+/post/[A-Za-z0-9_-]+)>`
-
+	// Patterns are precompiled at startup; see globals.
 	// Debug: show the regex patterns we're using
 	log.Printf("[DEBUG] onMessageCreate: linkPattern=%q surroundedPattern=%q", linkPattern, surroundedPattern)
-	reLink := regexp.MustCompile(linkPattern)
-	reSurrounded := regexp.MustCompile(surroundedPattern)
 
-	matches := reLink.FindAllStringSubmatch(m.Content, -1)
+	matches := reLinkCompiled.FindAllStringSubmatch(m.Content, -1)
 	if len(matches) == 0 {
 		log.Printf("[DEBUG] onMessageCreate: no link matches in message")
 		// also log whether the message contains a surrounded link (which we skip)
-		if reSurrounded.MatchString(m.Content) {
+		if reSurroundedCompiled.MatchString(m.Content) {
 			log.Printf("[DEBUG] onMessageCreate: message contains surrounded link; skipping per design")
 		}
 		return
@@ -1171,7 +1195,7 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 	}
 
 	// If any link is surrounded by <...>, skip processing entirely (per original logic which checks per message)
-	if reSurrounded.MatchString(m.Content) {
+	if reSurroundedCompiled.MatchString(m.Content) {
 		return
 	}
 
@@ -1237,14 +1261,45 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 				modifiedLink = fmt.Sprintf("fixthreads.net/@%s/post/%s", userOrCommunity, postID)
 				displayText = fmt.Sprintf("Threads • @%s", userOrCommunity)
 			}
+		case "facebook.com", "m.facebook.com":
+			service = "Facebook"
+			re := regexp.MustCompile(`(?:m\.)?facebook\.com/([^/?#]+)/posts/[0-9]+`)
+			mm := re.FindStringSubmatch(originalLink)
+			if len(mm) > 1 {
+				userOrCommunity = mm[1]
+			} else {
+				re = regexp.MustCompile(`(?:m\.)?facebook\.com/groups/([0-9]+)/posts/[0-9]+`)
+				mm = re.FindStringSubmatch(originalLink)
+				if len(mm) > 1 {
+					userOrCommunity = "Group " + mm[1]
+				} else {
+					re = regexp.MustCompile(`(?:m\.)?facebook\.com/reel/([A-Za-z0-9_-]+)`)
+					mm = re.FindStringSubmatch(originalLink)
+					if len(mm) > 1 {
+						userOrCommunity = "Reel " + mm[1]
+					} else {
+						re = regexp.MustCompile(`(?:m\.)?facebook\.com/watch/\?v=([0-9]+)`)
+						mm = re.FindStringSubmatch(originalLink)
+						if len(mm) > 1 {
+							userOrCommunity = "Video " + mm[1]
+						} else {
+							re = regexp.MustCompile(`(?:m\.)?facebook\.com/photo\.php\?fbid=([0-9]+)`)
+							mm = re.FindStringSubmatch(originalLink)
+							if len(mm) > 1 {
+								userOrCommunity = "Photo " + mm[1]
+							} else {
+								userOrCommunity = "Unknown"
+							}
+						}
+					}
+				}
+			}
 		case "bsky.app":
 			service = "Bluesky"
 			re := regexp.MustCompile(`bsky\.app/profile/([^/]+)/post/([A-Za-z0-9_-]+)`)
 			mm := re.FindStringSubmatch(originalLink)
 			if len(mm) > 2 {
 				userOrCommunity = mm[1]
-				postID := mm[2]
-				modifiedLink = fmt.Sprintf("bskyx.app/profile/%s/post/%s", userOrCommunity, postID)
 				displayText = fmt.Sprintf("Bluesky • %s", userOrCommunity)
 			}
 		}
@@ -1294,6 +1349,9 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 				modifiedLink = strings.ReplaceAll(modifiedLink, "threads.com", "fixthreads.net")
 			case "Pixiv":
 				modifiedLink = strings.ReplaceAll(originalLink, "pixiv.net", "phixiv.net")
+			case "Facebook":
+				modifiedLink = strings.ReplaceAll(originalLink, "m.facebook.com", "facebed.com")
+				modifiedLink = strings.ReplaceAll(modifiedLink, "facebook.com", "facebed.com")
 			case "Bluesky":
 				modifiedLink = strings.ReplaceAll(originalLink, "bsky.app", "fxbsky.app")
 			}
@@ -1391,6 +1449,11 @@ func main() {
 		log.Fatalf("DB init error: %v", err)
 	}
 	defer db.Close()
+
+	// Compile regexes at startup to avoid panics at runtime and catch errors early.
+	if err := compileRegexes(); err != nil {
+		log.Fatalf("regex compile error: %v", err)
+	}
 
 	intents := discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent | discordgo.IntentsGuilds
 	dg, err := discordgo.New("Bot " + token)
