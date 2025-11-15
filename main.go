@@ -102,7 +102,17 @@ func rateLimitedSend(s *discordgo.Session, channelID string, content string) err
 		if len(times) < MESSAGE_LIMIT {
 			times = append(times, now)
 			tsMutex.Unlock()
-			_, err := s.ChannelMessageSend(channelID, content)
+			// Use ChannelMessageSendComplex so we can include mention text in the message
+			// while suppressing actual Discord notifications via AllowedMentions.
+			msg := &discordgo.MessageSend{
+				Content: content,
+				AllowedMentions: &discordgo.MessageAllowedMentions{
+					// Empty Parse slice disables automatic mentions (users/roles/everyone),
+					// so including "<@userID>" in content will not trigger a notification.
+					Parse: []discordgo.AllowedMentionType{},
+				},
+			}
+			_, err := s.ChannelMessageSendComplex(channelID, msg)
 			return err
 		}
 		tsMutex.Unlock()
