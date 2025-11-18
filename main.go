@@ -71,6 +71,34 @@ func compileRegexes() error {
 	return nil
 }
 
+// stripCodeBlocks removes fenced triple-backtick code blocks and inline backtick code
+// so that links inside code samples are not recognized by the main link regexes.
+func stripCodeBlocks(s string) string {
+	// remove fenced code blocks: ```...```
+	for {
+		start := strings.Index(s, "```")
+		if start == -1 {
+			break
+		}
+		// Look for the closing fence after the opening one
+		rest := s[start+3:]
+		endRel := strings.Index(rest, "```")
+		if endRel == -1 {
+			// no closing fence - strip from start to end of string
+			s = s[:start]
+			break
+		}
+		end := start + 3 + endRel + 3
+		s = s[:start] + s[end:]
+	}
+
+	// remove inline code `...`
+	reInline := regexp.MustCompile("`[^`]*`")
+	s = reInline.ReplaceAllString(s, "")
+
+	return s
+}
+
 // GuildSettings mirrors the Python structure
 type GuildSettings struct {
 	EnabledServices []string
@@ -1183,11 +1211,20 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 	// Debug: show the regex patterns we're using
 	log.Printf("[DEBUG] onMessageCreate: linkPattern=%q surroundedPattern=%q", linkPattern, surroundedPattern)
 
-	matches := reLinkCompiled.FindAllStringSubmatch(m.Content, -1)
+	// Strip fenced and inline code blocks before running the link regex so links inside
+	// code samples are ignored (user requested behavior).
+	contentForMatching := stripCodeBlocks(m.Content)
+
+	// Debug: indicate we stripped code blocks when applicable
+	if contentForMatching != m.Content {
+		log.Printf("[DEBUG] onMessageCreate: stripped code blocks from message before matching")
+	}
+
+	matches := reLinkCompiled.FindAllStringSubmatch(contentForMatching, -1)
 	if len(matches) == 0 {
 		log.Printf("[DEBUG] onMessageCreate: no link matches in message")
 		// also log whether the message contains a surrounded link (which we skip)
-		if reSurroundedCompiled.MatchString(m.Content) {
+		if reSurroundedCompiled.MatchString(contentForMatching) {
 			log.Printf("[DEBUG] onMessageCreate: message contains surrounded link; skipping per design")
 		}
 		return
