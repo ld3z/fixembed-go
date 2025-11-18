@@ -20,7 +20,7 @@ import (
 )
 
 // Version number
-const VERSION = "1.1.9"
+const VERSION = "1.2.0"
 
 // Rate-limiting configuration
 const MESSAGE_LIMIT = 5
@@ -57,6 +57,21 @@ var (
 	reLinkCompiled       *regexp.Regexp
 	reSurroundedCompiled *regexp.Regexp
 )
+
+// MissingEmbed holds state for a message where Discord did not generate an embed.
+// We track alternate provider links and the current index so users can cycle.
+type MissingEmbed struct {
+	ChannelID     string
+	OrigMsgID     string
+	ProviderLinks []string
+	DisplayText   string
+	Index         int
+}
+
+var missingEmbeds = struct {
+	sync.Mutex
+	m map[string]*MissingEmbed
+}{m: make(map[string]*MissingEmbed)}
 
 func compileRegexes() error {
 	var err error
@@ -99,6 +114,40 @@ func stripCodeBlocks(s string) string {
 	return s
 }
 
+// getAlternateLinks returns a list of provider-host+path alternatives for a given service.
+// Each returned item is intended to be used in the existing formattedMessage as the "%s"
+// part after "https://".
+func getAlternateLinks(service string, originalLink string) []string {
+	var out []string
+	switch service {
+	case "Instagram":
+		out = append(out, strings.ReplaceAll(originalLink, "instagram.com", "instafix.ldez.top"))
+		out = append(out, strings.ReplaceAll(originalLink, "instagram.com", "kkinstagram.com"))
+	case "Reddit":
+		if strings.Contains(originalLink, "old.reddit.com") {
+			out = append(out, strings.ReplaceAll(originalLink, "old.reddit.com", "old.rxddit.com"))
+		} else {
+			out = append(out, strings.ReplaceAll(originalLink, "reddit.com", "vxreddit.ldez.workers.dev"))
+		}
+	default:
+		// fallback: return the original as a single option
+		out = append(out, originalLink)
+	}
+	// dedupe while preserving order
+	seen := make(map[string]bool)
+	res := make([]string, 0, len(out))
+	for _, v := range out {
+		if v == "" {
+			continue
+		}
+		if !seen[v] {
+			seen[v] = true
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
 // GuildSettings mirrors the Python structure
 type GuildSettings struct {
 	EnabledServices []string
@@ -110,7 +159,7 @@ func defaultServices() []string {
 	return []string{"Twitter", "Instagram", "Reddit", "Threads", "Pixiv", "Bluesky", "Facebook"}
 }
 
-func rateLimitedSend(s *discordgo.Session, channelID string, content string) error {
+func rateLimitedSend(s *discordgo.Session, channelID string, content string) (*discordgo.Message, error) {
 	// Simple sliding-window rate limiter matching Python behaviour
 	for {
 		tsMutex.Lock()
@@ -140,8 +189,8 @@ func rateLimitedSend(s *discordgo.Session, channelID string, content string) err
 					Parse: []discordgo.AllowedMentionType{},
 				},
 			}
-			_, err := s.ChannelMessageSendComplex(channelID, msg)
-			return err
+			sent, err := s.ChannelMessageSendComplex(channelID, msg)
+			return sent, err
 		}
 		tsMutex.Unlock()
 		time.Sleep(100 * time.Millisecond)
@@ -443,7 +492,7 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 				{
 					Name: "🎉 Quick Links",
 					Value: "- [Invite FixEmbed](https://discord.com/oauth2/authorize?client_id=1360722454678605914)\n" +
-						"- [Star our Source Code on GitHub](https://github.com/ld3z/fixembed-go)",
+						"- [Star the Source Code on GitHub](https://github.com/ld3z/eguchi-bot)",
 					Inline: false,
 				},
 				{
@@ -728,6 +777,73 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 	if i.Type == discordgo.InteractionMessageComponent {
 		data := i.MessageComponentData()
 		custom := data.CustomID
+		// Quick handler for the missing-embed cycling UI
+		if strings.HasPrefix(custom, "cycle_embed:") {
+			orig := strings.TrimPrefix(custom, "cycle_embed:")
+			missingEmbeds.Lock()
+			me, ok := missingEmbeds.m[orig]
+			if ok && me != nil {
+				// advance index
+				me.Index = (me.Index + 1) % len(me.ProviderLinks)
+				idx := me.Index
+				link := me.ProviderLinks[idx]
+				// keep the same button so users can continue cycling
+				btn := discordgo.Button{
+					CustomID: "cycle_embed:" + orig,
+					Label:    "Next provider",
+					Style:    discordgo.PrimaryButton,
+				}
+				components := []discordgo.MessageComponent{
+					&discordgo.ActionsRow{Components: []discordgo.MessageComponent{btn}},
+				}
+				content := fmt.Sprintf("[%s](https://%s)", me.DisplayText, link)
+				missingEmbeds.Unlock()
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseUpdateMessage,
+					Data: &discordgo.InteractionResponseData{
+						Content:    content,
+						Components: components,
+					},
+				})
+
+				// After updating the message to show the selected provider, check briefly
+				// whether Discord created an embed for that provider link. If an embed
+				// appears, remove the "Next provider" button (to prevent spamming) and
+				// delete the missingEmbeds entry for this watched message.
+				go func(watchedMsgID, channelID, updatedContent string) {
+					// small delay to allow Discord to attempt embedding the updated content
+					time.Sleep(2 * time.Second)
+					msg, err := s.ChannelMessage(channelID, watchedMsgID)
+					if err != nil || msg == nil {
+						return
+					}
+					if len(msg.Embeds) > 0 {
+						empty := []discordgo.MessageComponent{}
+						_, _ = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+							ID:         watchedMsgID,
+							Channel:    channelID,
+							Content:    &updatedContent,
+							Components: &empty,
+						})
+						missingEmbeds.Lock()
+						delete(missingEmbeds.m, watchedMsgID)
+						missingEmbeds.Unlock()
+					}
+				}(orig, me.ChannelID, content)
+			} else {
+				missingEmbeds.Unlock()
+				// nothing found: reply ephemeral
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "No alternate providers found.",
+						Flags:   1 << 6, // ephemeral
+					},
+				})
+			}
+			return
+		}
+
 		guildID := i.GuildID
 		var gidInt int64
 		if guildID != "" {
@@ -1410,24 +1526,70 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 				formattedMessage = formattedMessage + fmt.Sprintf(" | Sent by %s", m.Author.Username)
 			}
 
+			// compute alternate provider links for cycling UI later
+			providers := getAlternateLinks(service, originalLink)
+
 			// Debug: log the rewritten message before sending
 			log.Printf("[DEBUG] onMessageCreate: original=%s service=%s userOrCommunity=%s modified=%s formatted=%s deleteOriginal=%t", originalLink, service, userOrCommunity, modifiedLink, formattedMessage, deleteOriginal)
 
+			// send the rewritten message while capturing the sent message so we can watch it for embeds
+			sentMsg, _ := rateLimitedSend(s, m.ChannelID, formattedMessage)
+
+			// If we successfully sent a message, and deleteOriginal is requested, delete the original.
 			if deleteOriginal {
-				_ = rateLimitedSend(s, m.ChannelID, formattedMessage)
 				_ = s.ChannelMessageDelete(m.ChannelID, m.ID)
-			} else {
-				// Attempt to suppress embeds on the original message (set SUPPRESS_EMBEDS flag)
-				// In Discord, SUPPRESS_EMBEDS == 4
-				// discordgo MessageEdit.Flags is discordgo.MessageFlags; construct value accordingly
-				flags := discordgo.MessageFlags(1 << 2)
-				_, _ = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
-					ID:      m.ID,
-					Channel: m.ChannelID,
-					Content: &m.Content,
-					Flags:   flags,
-				})
-				_ = rateLimitedSend(s, m.ChannelID, formattedMessage)
+			}
+
+			// Start a watcher that checks the bot's sent message for embeds after ~30s and offers a "Missing embed?" UI
+			if sentMsg != nil && len(providers) > 0 {
+				sentID := sentMsg.ID
+				// capture locals
+				go func(channelID, watchedMsgID, dispText string, provs []string) {
+					time.Sleep(30 * time.Second)
+					// Try to fetch the bot's message; if it has any embeds, no action required.
+					msg, err := s.ChannelMessage(channelID, watchedMsgID)
+					if err != nil || msg == nil {
+						return
+					}
+					if len(msg.Embeds) > 0 {
+						return
+					}
+
+					// store cycle state keyed by the watched message id
+					missingEmbeds.Lock()
+					missingEmbeds.m[watchedMsgID] = &MissingEmbed{
+						ChannelID:     channelID,
+						OrigMsgID:     watchedMsgID,
+						ProviderLinks: provs,
+						DisplayText:   dispText,
+						Index:         0,
+					}
+					missingEmbeds.Unlock()
+
+					// Build button to cycle providers
+					btnCID := "cycle_embed:" + watchedMsgID
+					btn := discordgo.Button{
+						CustomID: btnCID,
+						Label:    "Next provider",
+						Style:    discordgo.PrimaryButton,
+					}
+					components := []discordgo.MessageComponent{
+						&discordgo.ActionsRow{Components: []discordgo.MessageComponent{btn}},
+					}
+
+					// initial provider shown alongside the italic prompt
+					initialLink := provs[0]
+					initialContent := fmt.Sprintf("*Missing embed?* — %s", fmt.Sprintf("[%s](https://%s)", dispText, initialLink))
+
+					// Edit the bot's previously sent message to include the italic prompt and provider-cycle button.
+					// watchedMsgID is the bot message we sent earlier (passed in as watchedMsgID).
+					_, _ = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+						ID:         watchedMsgID,
+						Channel:    channelID,
+						Content:    &initialContent,
+						Components: &components,
+					})
+				}(m.ChannelID, sentID, displayText, providers)
 			}
 		}
 	}
