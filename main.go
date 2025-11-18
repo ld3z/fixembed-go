@@ -123,6 +123,7 @@ func getAlternateLinks(service string, originalLink string) []string {
 	case "Instagram":
 		out = append(out, strings.ReplaceAll(originalLink, "instagram.com", "instafix.ldez.top"))
 		out = append(out, strings.ReplaceAll(originalLink, "instagram.com", "kkinstagram.com"))
+		out = append(out, strings.ReplaceAll(originalLink, "instagram.com", "vxinstagram.com"))
 	case "Reddit":
 		if strings.Contains(originalLink, "old.reddit.com") {
 			out = append(out, strings.ReplaceAll(originalLink, "old.reddit.com", "old.rxddit.com"))
