@@ -516,7 +516,7 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 				},
 			})
 		case "owner":
-			// Owner-only command: show detailed guild info (rich embeds)
+			// Owner-only command: list guilds (simplified - no API calls)
 			userID := ""
 			if i.Member != nil && i.Member.User != nil {
 				userID = i.Member.User.ID
@@ -533,67 +533,10 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 					},
 				})
 			} else {
-				// Build up to 10 embeds with useful guild information (name, id, members, owner, icon)
+				// Build guild list using only cached state (no API calls)
 				embeds := make([]*discordgo.MessageEmbed, 0, 10)
 				total := len(s.State.Guilds)
 				for _, g := range s.State.Guilds {
-					// Attempt multiple strategies to get a reliable member count:
-					// 1) Fetch full guild (s.Guild) and use MemberCount if present.
-					// 2) If unavailable, try GuildPreview to get ApproximateMemberCount.
-					// 3) Fall back to cached state member count (may be stale).
-					memberCount := 0
-					memberCountApprox := false
-					ownerStr := "Unknown"
-					iconURL := ""
-
-					// Try fetching full guild info
-					if gInfo, err := s.Guild(g.ID); err == nil && gInfo != nil {
-						if gInfo.MemberCount > 0 {
-							memberCount = gInfo.MemberCount
-						}
-						if gInfo.OwnerID != "" {
-							ownerStr = gInfo.OwnerID
-						}
-						if gInfo.Icon != "" {
-							iconURL = fmt.Sprintf("https://cdn.discordapp.com/icons/%s/%s.png", g.ID, gInfo.Icon)
-						}
-					}
-
-					// If we still don't have a member count, try guild preview (gives approximate count for public guilds)
-					if memberCount == 0 {
-						if preview, err := s.GuildPreview(g.ID); err == nil && preview != nil && preview.ApproximateMemberCount > 0 {
-							memberCount = preview.ApproximateMemberCount
-							memberCountApprox = true
-						}
-					}
-
-					// Final fallback: use cached state value if present
-					if memberCount == 0 && g.MemberCount > 0 {
-						memberCount = g.MemberCount
-						memberCountApprox = true
-					}
-
-					// Owner fallback from state
-					if ownerStr == "Unknown" {
-						if g.OwnerID != "" {
-							ownerStr = g.OwnerID
-						}
-					}
-
-					// Icon fallback from state
-					if iconURL == "" && g.Icon != "" {
-						iconURL = fmt.Sprintf("https://cdn.discordapp.com/icons/%s/%s.png", g.ID, g.Icon)
-					}
-
-					memberStr := "Unknown"
-					if memberCount > 0 {
-						if memberCountApprox {
-							memberStr = fmt.Sprintf("%d (approx.)", memberCount)
-						} else {
-							memberStr = fmt.Sprintf("%d", memberCount)
-						}
-					}
-
 					embed := &discordgo.MessageEmbed{
 						Title:       g.Name,
 						Description: fmt.Sprintf("ID: %s", g.ID),
@@ -601,18 +544,20 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 						Fields: []*discordgo.MessageEmbedField{
 							{
 								Name:   "Members",
-								Value:  memberStr,
+								Value:  fmt.Sprintf("%d", g.MemberCount),
 								Inline: true,
 							},
 							{
 								Name:   "Owner ID",
-								Value:  ownerStr,
+								Value:  g.OwnerID,
 								Inline: true,
 							},
 						},
 					}
-					if iconURL != "" {
-						embed.Thumbnail = &discordgo.MessageEmbedThumbnail{URL: iconURL}
+					if g.Icon != "" {
+						embed.Thumbnail = &discordgo.MessageEmbedThumbnail{
+							URL: fmt.Sprintf("https://cdn.discordapp.com/icons/%s/%s.png", g.ID, g.Icon),
+						}
 					}
 					embeds = append(embeds, embed)
 					// limit to 10 embeds to respect Discord limits
