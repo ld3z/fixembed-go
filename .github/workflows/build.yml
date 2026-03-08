@@ -1,8 +1,12 @@
-name: Build and upload native binaries
+name: Release
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,20 +19,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ${{ env.GOMODCACHE }}
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-
-      - name: Install dependencies
-        run: go mod download
 
       - name: Test
         run: go test ./...
@@ -41,17 +34,62 @@ jobs:
         run: |
           set -e
           mkdir -p dist
+
+          version="${GITHUB_REF_NAME#v}"
+          ldflags="-s -w -X main.Version=${version}"
+
           if [ "${{ matrix.os }}" = "windows" ]; then
             ext=".exe"
           else
             ext=""
           fi
           out="dist/fixembed-${{ matrix.os }}-${{ matrix.arch }}${ext}"
-          echo "Building $out"
-          go build -o "$out" ./...
+          echo "Building $out (version ${version})"
+          go build -ldflags "${ldflags}" -o "$out" ./...
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: fixembed-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/fixembed-${{ matrix.os }}-${{ matrix.arch }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/fixembed-*/; do
+            cp "$dir"* release/
+          done
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          files: release/*
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

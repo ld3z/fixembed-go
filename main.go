@@ -19,8 +19,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Version number
-const VERSION = "1.2.0"
+// Version is set at build time via ldflags; falls back to "dev".
+var Version = "dev"
 
 // Rate-limiting configuration
 const MESSAGE_LIMIT = 5
@@ -201,7 +201,7 @@ func rateLimitedSend(s *discordgo.Session, channelID string, content string) (*d
 func createFooter(embed *discordgo.MessageEmbed, s *discordgo.Session) {
 	if s.State != nil && s.State.User != nil {
 		embed.Footer = &discordgo.MessageEmbedFooter{
-			Text:    fmt.Sprintf("%s | v%s", s.State.User.Username, VERSION),
+			Text:    fmt.Sprintf("%s | v%s", s.State.User.Username, Version),
 			IconURL: s.State.User.AvatarURL(""),
 		}
 	}
