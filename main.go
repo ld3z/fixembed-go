@@ -73,6 +73,17 @@ var missingEmbeds = struct {
 	m map[string]*MissingEmbed
 }{m: make(map[string]*MissingEmbed)}
 
+// DefenderConfig stores the configuration for a single defender channel.
+type DefenderConfig struct {
+	GuildID      int64
+	LogChannelID int64
+}
+
+var defenderChannels = struct {
+	sync.RWMutex
+	m map[int64]*DefenderConfig // keyed by channel_id
+}{m: make(map[int64]*DefenderConfig)}
+
 func compileRegexes() error {
 	var err error
 	reLinkCompiled, err = regexp.Compile(linkPattern)
@@ -229,6 +240,15 @@ func initDB(path string) (*sql.DB, error) {
 	// Add columns if missing (sqlite will error - ignore duplicate column)
 	_, _ = db.Exec(`ALTER TABLE guild_settings ADD COLUMN mention_users BOOLEAN DEFAULT 1`)
 	_, _ = db.Exec(`ALTER TABLE guild_settings ADD COLUMN delete_original BOOLEAN DEFAULT 1`)
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS defender_channels (
+		channel_id INTEGER PRIMARY KEY,
+		guild_id INTEGER NOT NULL,
+		log_channel_id INTEGER NOT NULL
+	)`)
+	if err != nil {
+		return nil, err
+	}
 
 	return db, nil
 }
@@ -424,6 +444,165 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+func loadDefenderChannels(db *sql.DB) error {
+	rows, err := db.Query("SELECT channel_id, guild_id, log_channel_id FROM defender_channels")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	defenderChannels.Lock()
+	defer defenderChannels.Unlock()
+
+	for rows.Next() {
+		var channelID, guildID, logChannelID int64
+		if err := rows.Scan(&channelID, &guildID, &logChannelID); err != nil {
+			continue
+		}
+		defenderChannels.m[channelID] = &DefenderConfig{
+			GuildID:      guildID,
+			LogChannelID: logChannelID,
+		}
+	}
+	return nil
+}
+
+func addDefenderChannel(db *sql.DB, channelID, guildID, logChannelID int64) error {
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		_, err := db.Exec("INSERT OR REPLACE INTO defender_channels (channel_id, guild_id, log_channel_id) VALUES (?, ?, ?)",
+			channelID, guildID, logChannelID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if strings.Contains(err.Error(), "database is locked") {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return err
+	}
+	return lastErr
+}
+
+func removeDefenderChannel(db *sql.DB, channelID int64) error {
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		_, err := db.Exec("DELETE FROM defender_channels WHERE channel_id = ?", channelID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if strings.Contains(err.Error(), "database is locked") {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return err
+	}
+	return lastErr
+}
+
+func getDefenderChannelsForGuild(db *sql.DB, guildID int64) ([]struct{ ChannelID, LogChannelID int64 }, error) {
+	rows, err := db.Query("SELECT channel_id, log_channel_id FROM defender_channels WHERE guild_id = ?", guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []struct{ ChannelID, LogChannelID int64 }
+	for rows.Next() {
+		var cid, lid int64
+		if err := rows.Scan(&cid, &lid); err != nil {
+			continue
+		}
+		results = append(results, struct{ ChannelID, LogChannelID int64 }{cid, lid})
+	}
+	return results, nil
+}
+
+func hasAdminPermission(s *discordgo.Session, guildID string, memberRoles []string) bool {
+	guild, err := s.State.Guild(guildID)
+	if err != nil {
+		return false
+	}
+	for _, roleID := range memberRoles {
+		for _, guildRole := range guild.Roles {
+			if guildRole.ID == roleID && guildRole.Permissions&discordgo.PermissionAdministrator != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func handleDefender(s *discordgo.Session, m *discordgo.MessageCreate, config *DefenderConfig) {
+	if m.Author.Bot {
+		return
+	}
+
+	guild, err := s.State.Guild(m.GuildID)
+	if err == nil && guild.OwnerID == m.Author.ID {
+		return
+	}
+
+	if m.Member != nil && hasAdminPermission(s, m.GuildID, m.Member.Roles) {
+		return
+	}
+
+	reason := fmt.Sprintf("Defender: posted in defender channel <#%s>", m.ChannelID)
+	err = s.GuildBanCreateWithReason(m.GuildID, m.Author.ID, reason, 1)
+	if err != nil {
+		log.Printf("[DEFENDER] Failed to ban user %s in guild %s: %v", m.Author.ID, m.GuildID, err)
+		return
+	}
+	log.Printf("[DEFENDER] Banned user %s (%s) in guild %s", m.Author.ID, m.Author.Username, m.GuildID)
+
+	logChannelStr := strconv.FormatInt(config.LogChannelID, 10)
+
+	msgContent := m.Content
+	if msgContent == "" {
+		msgContent = "*No text content*"
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "Defender Triggered",
+		Description: fmt.Sprintf("**%s** (`%s`) was permanently banned.", m.Author.Username, m.Author.ID),
+		Color:       0xFF0000,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Defender Channel",
+				Value:  fmt.Sprintf("<#%s>", m.ChannelID),
+				Inline: true,
+			},
+			{
+				Name:   "Message Content",
+				Value:  truncateString(msgContent, 1024),
+				Inline: false,
+			},
+		},
+		Thumbnail: &discordgo.MessageEmbedThumbnail{
+			URL: m.Author.AvatarURL("128"),
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	createFooter(embed, s)
+
+	_, err = s.ChannelMessageSendEmbed(logChannelStr, embed)
+	if err != nil {
+		log.Printf("[DEFENDER] Failed to send log to channel %s: %v", logChannelStr, err)
+	}
+}
+
 // Interaction (slash command) handling
 func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	// Only handle application commands and component interactions
@@ -595,6 +774,160 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 					},
 				})
 			}
+		case "defender":
+			// Permission check: only administrators can manage defender channels.
+			memberPerms := int64(0)
+			if i.Member != nil {
+				memberPerms = i.Member.Permissions
+			}
+			if memberPerms&discordgo.PermissionAdministrator == 0 {
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "You need **Administrator** permission to manage defender channels.",
+						Flags:   1 << 6,
+					},
+				})
+				break
+			}
+
+			opts := i.ApplicationCommandData().Options
+			if len(opts) == 0 {
+				break
+			}
+			subcmd := opts[0]
+			guildID := i.GuildID
+			gidInt, _ := discordIDStringToInt64(guildID)
+
+			switch subcmd.Name {
+			case "set":
+				var channelID, logChannelID string
+				for _, opt := range subcmd.Options {
+					switch opt.Name {
+					case "channel":
+						channelID = opt.Value.(string)
+					case "log_channel":
+						logChannelID = opt.Value.(string)
+					}
+				}
+
+				cidInt, _ := discordIDStringToInt64(channelID)
+				lidInt, _ := discordIDStringToInt64(logChannelID)
+
+				if err := addDefenderChannel(db, cidInt, gidInt, lidInt); err != nil {
+					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: fmt.Sprintf("Failed to set defender channel: %v", err),
+							Flags:   1 << 6,
+						},
+					})
+					break
+				}
+
+				defenderChannels.Lock()
+				defenderChannels.m[cidInt] = &DefenderConfig{GuildID: gidInt, LogChannelID: lidInt}
+				defenderChannels.Unlock()
+
+				embed := &discordgo.MessageEmbed{
+					Title:       "Defender Configured",
+					Description: fmt.Sprintf("🛡️ <#%s> is now a defender channel.\n\nAnyone who posts there will be **permanently banned** and their messages from the past 24 hours will be deleted.\n\nBan logs will be sent to <#%s>.", channelID, logChannelID),
+					Color:       0xFF9900,
+				}
+				createFooter(embed, s)
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Embeds: []*discordgo.MessageEmbed{embed},
+						Flags:  1 << 6,
+					},
+				})
+
+			case "remove":
+				var channelID string
+				if len(subcmd.Options) > 0 {
+					channelID = subcmd.Options[0].Value.(string)
+				}
+
+				cidInt, _ := discordIDStringToInt64(channelID)
+
+				defenderChannels.RLock()
+				_, exists := defenderChannels.m[cidInt]
+				defenderChannels.RUnlock()
+
+				if !exists {
+					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: fmt.Sprintf("<#%s> is not a defender channel.", channelID),
+							Flags:   1 << 6,
+						},
+					})
+					break
+				}
+
+				if err := removeDefenderChannel(db, cidInt); err != nil {
+					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: fmt.Sprintf("Failed to remove defender channel: %v", err),
+							Flags:   1 << 6,
+						},
+					})
+					break
+				}
+
+				defenderChannels.Lock()
+				delete(defenderChannels.m, cidInt)
+				defenderChannels.Unlock()
+
+				embed := &discordgo.MessageEmbed{
+					Title:       "Defender Removed",
+					Description: fmt.Sprintf("✅ <#%s> is no longer a defender channel.", channelID),
+					Color:       0x78b159,
+				}
+				createFooter(embed, s)
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Embeds: []*discordgo.MessageEmbed{embed},
+						Flags:  1 << 6,
+					},
+				})
+
+			case "list":
+				dfList, err := getDefenderChannelsForGuild(db, gidInt)
+				if err != nil || len(dfList) == 0 {
+					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: "No defender channels configured in this server.",
+							Flags:   1 << 6,
+						},
+					})
+					break
+				}
+
+				desc := ""
+				for idx, hp := range dfList {
+					desc += fmt.Sprintf("%d. <#%d> → logs to <#%d>\n", idx+1, hp.ChannelID, hp.LogChannelID)
+				}
+
+				embed := &discordgo.MessageEmbed{
+					Title:       "Defender Channels",
+					Description: desc,
+					Color:       0xFF9900,
+				}
+				createFooter(embed, s)
+				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Embeds: []*discordgo.MessageEmbed{embed},
+						Flags:  1 << 6,
+					},
+				})
+			}
+
 		case "settings":
 			// Provide a simple text-based settings reply summarizing current settings.
 			guildID := i.GuildID
@@ -1236,6 +1569,17 @@ func onMessageCreate(db *sql.DB, s *discordgo.Session, m *discordgo.MessageCreat
 	if m.GuildID == "" {
 		return
 	}
+
+	// Defender check — must run before any other processing
+	dfCidInt, _ := discordIDStringToInt64(m.ChannelID)
+	defenderChannels.RLock()
+	dfConfig, isDefender := defenderChannels.m[dfCidInt]
+	defenderChannels.RUnlock()
+	if isDefender {
+		handleDefender(s, m, dfConfig)
+		return
+	}
+
 	gidInt, _ := discordIDStringToInt64(m.GuildID)
 
 	// Debug: log incoming message for troubleshooting link processing
@@ -1627,6 +1971,9 @@ func main() {
 		if err := loadSettings(db); err != nil {
 			log.Printf("Error loading settings: %v", err)
 		}
+		if err := loadDefenderChannels(db); err != nil {
+			log.Printf("Error loading defender channels: %v", err)
+		}
 
 		// Register application commands per-guild to mirror Python client.tree.sync behaviour.
 		commands := []*discordgo.ApplicationCommand{
@@ -1665,6 +2012,50 @@ func main() {
 			{
 				Name:        "owner",
 				Description: "Owner-only command: lists guilds the bot is in",
+			},
+			{
+				Name:                     "defender",
+				Description:              "Configure defender channels that auto-ban users who post in them",
+				DefaultMemberPermissions: func() *int64 { v := int64(discordgo.PermissionAdministrator); return &v }(),
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:        discordgo.ApplicationCommandOptionSubCommand,
+						Name:        "set",
+						Description: "Designate a channel as a defender trap",
+						Options: []*discordgo.ApplicationCommandOption{
+							{
+								Type:        discordgo.ApplicationCommandOptionChannel,
+								Name:        "channel",
+								Description: "The channel to use as a defender trap",
+								Required:    true,
+							},
+							{
+								Type:        discordgo.ApplicationCommandOptionChannel,
+								Name:        "log_channel",
+								Description: "The channel where ban logs will be sent",
+								Required:    true,
+							},
+						},
+					},
+					{
+						Type:        discordgo.ApplicationCommandOptionSubCommand,
+						Name:        "remove",
+						Description: "Remove a defender channel",
+						Options: []*discordgo.ApplicationCommandOption{
+							{
+								Type:        discordgo.ApplicationCommandOptionChannel,
+								Name:        "channel",
+								Description: "The defender channel to remove",
+								Required:    true,
+							},
+						},
+					},
+					{
+						Type:        discordgo.ApplicationCommandOptionSubCommand,
+						Name:        "list",
+						Description: "List all defender channels in this server",
+					},
+				},
 			},
 		}
 
