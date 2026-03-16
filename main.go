@@ -665,14 +665,19 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 		case "about":
 			embed := &discordgo.MessageEmbed{
 				Title:       "About",
-				Description: "This bot fixes the lack of embed support in Discord.",
+				Description: "eguchi-bot fixes the lack of embed support in Discord and protects your server with built-in defender channels that automatically ban malicious users.",
 				Color:       0x7289DA,
 			}
 			embed.Fields = []*discordgo.MessageEmbedField{
 				{
 					Name: "🎉 Quick Links",
-					Value: "- [Invite FixEmbed](https://discord.com/oauth2/authorize?client_id=1360722454678605914)\n" +
+					Value: "- [Invite eguchi-bot](https://discord.com/oauth2/authorize?client_id=1360722454678605914)\n" +
 						"- [Star the Source Code on GitHub](https://github.com/ld3z/eguchi-bot)",
+					Inline: false,
+				},
+				{
+					Name:   "🛡️ Server Protection",
+					Value:  "Use `/defender set` to designate trap channels that automatically ban anyone who posts in them and log the action to a channel of your choice.",
 					Inline: false,
 				},
 				{
