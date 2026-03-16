@@ -717,9 +717,19 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 					},
 				})
 			} else {
-				// Build guild list using only cached state (no API calls)
-				embeds := make([]*discordgo.MessageEmbed, 0, 10)
 				total := len(s.State.Guilds)
+				if total == 0 {
+					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: "Bot is not in any guilds.",
+							Flags:   1 << 6,
+						},
+					})
+					break
+				}
+
+				var embeds []*discordgo.MessageEmbed
 				for _, g := range s.State.Guilds {
 					embed := &discordgo.MessageEmbed{
 						Title:       g.Name,
@@ -744,40 +754,31 @@ func onInteractionCreate(db *sql.DB, s *discordgo.Session, i *discordgo.Interact
 						}
 					}
 					embeds = append(embeds, embed)
-					// limit to 10 embeds to respect Discord limits
-					if len(embeds) >= 10 {
-						break
-					}
-				}
-				if len(embeds) == 0 {
-					// No guilds
-					_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-						Type: discordgo.InteractionResponseChannelMessageWithSource,
-						Data: &discordgo.InteractionResponseData{
-							Content: "Bot is not in any guilds.",
-							Flags:   1 << 6, // ephemeral
-						},
-					})
-					break
 				}
 
-				// If there are more guilds than we showed, append a summary embed
-				if total > len(embeds) {
-					summary := &discordgo.MessageEmbed{
-						Title:       "Summary",
-						Description: fmt.Sprintf("Showing %d of %d guilds", len(embeds), total),
-						Color:       0x00b894,
-					}
-					embeds = append(embeds, summary)
+				// Discord allows max 10 embeds per message; send in batches.
+				firstBatch := embeds
+				if len(firstBatch) > 10 {
+					firstBatch = embeds[:10]
 				}
-
 				_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 					Type: discordgo.InteractionResponseChannelMessageWithSource,
 					Data: &discordgo.InteractionResponseData{
-						Embeds: embeds,
-						Flags:  1 << 6, // ephemeral
+						Embeds: firstBatch,
+						Flags:  1 << 6,
 					},
 				})
+
+				for start := 10; start < len(embeds); start += 10 {
+					end := start + 10
+					if end > len(embeds) {
+						end = len(embeds)
+					}
+					_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+						Embeds: embeds[start:end],
+						Flags:  1 << 6,
+					})
+				}
 			}
 		case "defender":
 			// Permission check: only administrators can manage defender channels.
